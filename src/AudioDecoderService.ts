@@ -14,6 +14,18 @@ export interface AudioMetadata {
     fileSize: number;
 }
 
+export interface WaveformPeakLevel {
+    samplesPerBucket: number;
+    min: Float32Array[];
+    max: Float32Array[];
+}
+
+export interface DecodedSamples {
+    samples: Float32Array[];
+    peakLevels: WaveformPeakLevel[];
+    decodeTimeMs: number;
+}
+
 /**
  * WASM-based audio decoder service with async loading support
  */
@@ -89,6 +101,32 @@ export class AudioDecoderService {
         return avioflow;
     }
 
+    public async getSupportedFileExtensions(): Promise<string[]> {
+        const avioflow = await this.loadWasm();
+        const extensions = new Set<string>();
+        for (const formatGroup of avioflow.getSupportedInputFormats()) {
+            for (const format of String(formatGroup).split(',')) {
+                const extension = format.trim().toLowerCase();
+                if (/^[a-z0-9]+$/.test(extension)) {
+                    extensions.add(extension);
+                }
+            }
+        }
+
+        const decoders = new Set<string>(avioflow.getSupportedDecoders());
+        if (decoders.has('opus')) extensions.add('opus');
+        if (extensions.has('ogg')) extensions.add('oga');
+        if (extensions.has('aiff')) {
+            extensions.add('aif');
+            extensions.add('aifc');
+        }
+        if (extensions.has('matroska')) extensions.add('mka');
+        if (extensions.has('asf') || extensions.has('xwma')) extensions.add('wma');
+        if (extensions.has('wav')) extensions.add('wave');
+
+        return [...extensions].sort();
+    }
+
     /**
      * Phase 1: Quick metadata loading (fast, ~10ms)
      */
@@ -108,7 +146,7 @@ export class AudioDecoderService {
 
         // Create decoder instance and open buffer
         const decoder = new avioflow.AudioDecoder();
-        decoder.openBuffer(uint8Array);
+        decoder.loadBuffer(uint8Array);
 
         // Get metadata only (fast)
         const metaStart = Date.now();
@@ -133,38 +171,114 @@ export class AudioDecoderService {
     }
 
     /**
-     * Phase 2: Decode all samples (slow, async)
+     * Bucket sizes (samples per bucket) for the waveform peak levels,
+     * ascending. Rendering picks the coarsest level that's still finer than
+     * the current on-screen samples-per-pixel, so this range has to span from
+     * "fully zoomed in" (fall back to raw samples) to "fully zoomed out".
      */
-    public async getSamples(decoder: any): Promise<{ samples: any[]; decodeTimeMs: number }> {
+    private static readonly PEAK_BUCKET_SIZES = [64, 512, 4096, 32768, 262144];
+
+    /**
+     * Phase 2: Decode all samples (slow, async), plus min/max peak levels for
+     * fast waveform rendering at any zoom level without rescanning raw
+     * samples in JS.
+     */
+    public async getSamples(decoder: any, startSeconds = 0, stopSeconds = -1): Promise<DecodedSamples> {
         const startTime = Date.now();
 
         console.log('[AudioDecoderService] Starting sample decoding...');
 
         // This is the slow operation
-        const samples = decoder.getAllSamples();
+        const samples = decoder.getSamples(startSeconds, stopSeconds);
         const decodeTimeMs = Date.now() - startTime;
 
         console.log(`[AudioDecoderService] Samples decoded in ${decodeTimeMs}ms`);
 
         // Convert to array
-        const samplesArray: any[] = [];
+        const samplesArray: Float32Array[] = [];
         for (let i = 0; i < samples.length; i++) {
             samplesArray.push(samples[i]);
         }
 
-        return { samples: samplesArray, decodeTimeMs };
+        const peakLevels = AudioDecoderService.buildPeakLevels(samplesArray);
+
+        return { samples: samplesArray, peakLevels, decodeTimeMs };
+    }
+
+    public async getSamplesRange(fileBuffer: Buffer, startSeconds: number, stopSeconds: number): Promise<DecodedSamples> {
+        const avioflow = await this.loadWasm();
+        const decoder = new avioflow.AudioDecoder();
+        decoder.loadBuffer(new Uint8Array(fileBuffer));
+        try {
+            return await this.getSamples(decoder, startSeconds, stopSeconds);
+        } finally {
+            if (typeof decoder.delete === 'function') decoder.delete();
+            else if (typeof decoder.dispose === 'function') decoder.dispose();
+        }
+    }
+
+    private static buildPeakLevels(samples: Float32Array[]): WaveformPeakLevel[] {
+        const numChannels = samples.length;
+        if (numChannels === 0) {
+            return [];
+        }
+
+        const levels: WaveformPeakLevel[] = [];
+        let prevMin: Float32Array[] | null = null;
+        let prevMax: Float32Array[] | null = null;
+        let prevBucketSize = 1;
+
+        for (const bucketSize of AudioDecoderService.PEAK_BUCKET_SIZES) {
+            const min: Float32Array[] = new Array(numChannels);
+            const max: Float32Array[] = new Array(numChannels);
+            const group = Math.max(1, Math.floor(bucketSize / prevBucketSize));
+
+            for (let c = 0; c < numChannels; c++) {
+                const source: ArrayLike<number> = prevMin ? prevMin[c] : samples[c];
+                const sourceMax: ArrayLike<number> = prevMax ? prevMax[c] : samples[c];
+                const numBuckets = Math.ceil(source.length / group);
+                const bucketMin = new Float32Array(numBuckets);
+                const bucketMax = new Float32Array(numBuckets);
+
+                for (let b = 0; b < numBuckets; b++) {
+                    const start = b * group;
+                    const stop = Math.min(start + group, source.length);
+                    let bMin = Number.POSITIVE_INFINITY;
+                    let bMax = Number.NEGATIVE_INFINITY;
+                    for (let i = start; i < stop; i++) {
+                        const lo = source[i];
+                        const hi = sourceMax[i];
+                        if (lo < bMin) bMin = lo;
+                        if (hi > bMax) bMax = hi;
+                    }
+                    bucketMin[b] = bMin;
+                    bucketMax[b] = bMax;
+                }
+
+                min[c] = bucketMin;
+                max[c] = bucketMax;
+            }
+
+            levels.push({ samplesPerBucket: bucketSize, min, max });
+            prevMin = min;
+            prevMax = max;
+            prevBucketSize = bucketSize;
+        }
+
+        return levels;
     }
 
     /**
      * Legacy: Decode everything at once (for backwards compatibility)
      */
-    public async decodeAudioFile(filePath: string): Promise<{ metadata: AudioMetadata; samples: any[]; loadTimeMs: number }> {
+    public async decodeAudioFile(filePath: string): Promise<{ metadata: AudioMetadata; samples: Float32Array[]; peakLevels: WaveformPeakLevel[]; loadTimeMs: number }> {
         const { metadata, decoder } = await this.getMetadata(filePath);
-        const { samples, decodeTimeMs } = await this.getSamples(decoder);
+        const { samples, peakLevels, decodeTimeMs } = await this.getSamples(decoder, 0, -1);
 
         return {
             metadata,
             samples,
+            peakLevels,
             loadTimeMs: decodeTimeMs
         };
     }

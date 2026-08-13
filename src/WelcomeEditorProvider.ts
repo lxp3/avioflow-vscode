@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { AudioDecoderService } from './AudioDecoderService';
 
 export class WelcomeEditorProvider {
 
@@ -55,7 +56,7 @@ export class WelcomeEditorProvider {
             canSelectFolders: false,
             canSelectMany: false,
             filters: {
-                'Audio Files': ['wav', 'mp3', 'flac', 'ogg', 'aac', 'm4a']
+                'Audio Files': await AudioDecoderService.getInstance().getSupportedFileExtensions()
             },
             title: 'Select Audio File'
         });

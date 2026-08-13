@@ -2,8 +2,10 @@
 **/.vscode-test/**
 **/*.ts
 **/webview/**
-pnpm-lock.yaml
-pnpm-workspace.yaml
+**/.github/**
+scripts/**
+resources/**
+package-lock.json
 *.vsix
 build.ps1
 tsconfig.json

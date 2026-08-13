@@ -10,10 +10,21 @@ interface WebviewErrorMessage {
     code?: string;
 }
 
+interface AudioPreviewSession {
+    filePath: string;
+    fileBuffer: Buffer;
+    metadata: Awaited<ReturnType<AudioDecoderService['getMetadata']>>['metadata'];
+    pageDuration: number;
+    pageCount: number;
+}
+
 export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     private static currentPanel?: vscode.WebviewPanel;
     private static currentPanelReady = false;
     private static currentRequestId = 0;
+    private static readonly pcmPageBudgetBytes = 128 * 1024 * 1024;
+    private static readonly maxPageDurationSeconds = 30 * 60;
+    private currentSession?: AudioPreviewSession;
 
 
     public static register(context: vscode.ExtensionContext): vscode.Disposable {
@@ -73,6 +84,8 @@ export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider
                 await this.loadAndSendData(document, webviewPanel);
             } else if (e.type === 'selectFile') {
                 await vscode.commands.executeCommand('avioflow.openAudioFile');
+            } else if (e.type === 'loadPage' && Number.isInteger(e.pageIndex)) {
+                await this.loadAndSendPage(webviewPanel, e.pageIndex);
             }
         });
 
@@ -80,6 +93,7 @@ export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider
             if (AudioPreviewProvider.currentPanel === webviewPanel) {
                 AudioPreviewProvider.currentPanel = undefined;
                 AudioPreviewProvider.currentPanelReady = false;
+                this.currentSession = undefined;
             }
         });
     }
@@ -120,37 +134,85 @@ export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider
 
             // Phase 1: Quick metadata loading - show UI immediately
             console.log('[Avioflow] Phase 1: Loading metadata...');
-            const { metadata, decoder } = await service.getMetadata(filePath);
+            const { metadata, decoder, fileBuffer } = await service.getMetadata(filePath);
             if (!this.isCurrentRequest(webviewPanel, requestId)) {
                 return;
             }
+
+            const bytesPerSecond = Math.max(1, metadata.sampleRate * metadata.numChannels * Float32Array.BYTES_PER_ELEMENT);
+            const pageDuration = Math.max(1, Math.min(
+                AudioPreviewProvider.maxPageDurationSeconds,
+                Math.floor(AudioPreviewProvider.pcmPageBudgetBytes / bytesPerSecond)
+            ));
+            const pageCount = Math.max(1, Math.ceil(metadata.duration / pageDuration));
+            this.currentSession = { filePath, fileBuffer, metadata, pageDuration, pageCount };
+            if (typeof decoder.delete === 'function') decoder.delete();
+            else if (typeof decoder.dispose === 'function') decoder.dispose();
 
             // Send metadata immediately - UI can show info while samples load
             webviewPanel.webview.postMessage({
                 type: 'metadata',
                 filePath: filePath,
-                metadata: metadata
+                metadata: metadata,
+                pageDuration,
+                pageCount
             });
 
-            // Phase 2: Async sample decoding - runs in background
-            console.log('[Avioflow] Phase 2: Decoding samples...');
-            const { samples, decodeTimeMs } = await service.getSamples(decoder);
-            if (!this.isCurrentRequest(webviewPanel, requestId)) {
-                return;
-            }
-
-            // Send samples when ready - UI can now draw waveform
-            webviewPanel.webview.postMessage({
-                type: 'samples',
-                samples: samples,
-                decodeTimeMs: decodeTimeMs
-            });
-
-            console.log(`[Avioflow] Complete. Decode time: ${decodeTimeMs}ms`);
+            await this.loadAndSendPage(webviewPanel, 0);
 
         } catch (e: any) {
             const error = this.normalizeError(e, document.uri.fsPath);
             this.reportError(webviewPanel, error);
+        }
+    }
+
+    private async loadAndSendPage(webviewPanel: vscode.WebviewPanel, requestedPageIndex: number) {
+        const session = this.currentSession;
+        if (!session || AudioPreviewProvider.currentPanel !== webviewPanel) {
+            return;
+        }
+
+        const pageIndex = Math.max(0, Math.min(session.pageCount - 1, requestedPageIndex));
+        const pageStart = pageIndex * session.pageDuration;
+        const pageEnd = Math.min(session.metadata.duration, pageStart + session.pageDuration);
+        const requestId = ++AudioPreviewProvider.currentRequestId;
+
+        webviewPanel.webview.postMessage({
+            type: 'pageLoading',
+            pageIndex,
+            pageStart,
+            pageEnd,
+            requestId
+        });
+
+        try {
+            console.log(`[Avioflow] Decoding page ${pageIndex + 1}/${session.pageCount} [${pageStart}, ${pageEnd})...`);
+            const { samples, peakLevels, decodeTimeMs } = await AudioDecoderService.getInstance().getSamplesRange(
+                session.fileBuffer,
+                pageStart,
+                pageEnd
+            );
+            if (!this.isCurrentRequest(webviewPanel, requestId) || this.currentSession !== session) {
+                return;
+            }
+
+            webviewPanel.webview.postMessage({
+                type: 'samples',
+                samples,
+                peakLevels,
+                decodeTimeMs,
+                pageIndex,
+                pageStart,
+                pageEnd,
+                pageDuration: pageEnd - pageStart,
+                pageCount: session.pageCount,
+                requestId
+            });
+            console.log(`[Avioflow] Page ${pageIndex + 1} decoded in ${decodeTimeMs}ms`);
+        } catch (error) {
+            if (this.isCurrentRequest(webviewPanel, requestId)) {
+                this.reportError(webviewPanel, this.normalizeError(error, session.filePath));
+            }
         }
     }
 

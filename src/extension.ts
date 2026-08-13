@@ -27,7 +27,7 @@ export function activate(context: vscode.ExtensionContext) {
                     canSelectFolders: false,
                     canSelectMany: false,
                     filters: {
-                        'Audio Files': ['wav', 'mp3', 'flac', 'ogg', 'aac', 'm4a']
+                        'Audio Files': await AudioDecoderService.getInstance().getSupportedFileExtensions()
                     },
                     title: 'Select Audio File'
                 });

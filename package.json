@@ -48,7 +48,7 @@
         "displayName": "Avioflow Audio Preview",
         "selector": [
           {
-            "filenamePattern": "*.{mp3,wav,flac,m4a,ogg,aac}"
+            "filenamePattern": "*.{aac,ac3,aiff,aif,aifc,alaw,ape,asf,au,avi,dsf,f32be,f32le,f64be,f64le,flac,flv,m4v,matroska,mka,webm,mov,mp4,m4a,3gp,3g2,mj2,mp3,mpc,mpc8,mulaw,ogg,oga,opus,rm,s16be,s16le,s24be,s24le,s32be,s32le,s8,shn,tak,tta,u16be,u16le,u24be,u24le,u32be,u32le,u8,wav,wave,wma,wv,xwma}"
           }
         ],
         "priority": "default"
@@ -63,16 +63,16 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "pnpm run build",
+    "vscode:prepublish": "npm run build",
     "fetch:wasm": "node scripts/fetch-wasm.mjs",
-    "build": "pnpm run fetch:wasm && pnpm run compile",
-    "package": "pnpm exec vsce package --no-dependencies",
-    "compile": "pnpm run build:webview && tsc -p ./",
+    "build": "npm run fetch:wasm && npm run compile",
+    "package": "npx vsce package --no-dependencies",
+    "compile": "npm run build:webview && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "build:webview": "vite build webview"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@tailwindcss/vite": "^4.0.0",
     "@tsconfig/svelte": "^5.0.0",
     "@types/node": "^20.0.0",

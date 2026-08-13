@@ -22,7 +22,7 @@ This extension uses a high-performance **WebAssembly (WASM)** core built from C+
 
 ### VSIX Structure
 ```text
-avioflow-0.4.0.vsix
+avioflow-<version>.vsix
 |- extension/
 |  |- package.json
 |  |- README.md
@@ -36,22 +36,21 @@ avioflow-0.4.0.vsix
 
 ## Installation
 ```bash
-code --install-extension avioflow-0.4.0.vsix
+code --install-extension avioflow-<version>.vsix
 ```
 
 ## Getting Started
 
 ### Prerequisites
-- [Node.js](https://nodejs.org/) (installed in your system PATH)
-- [pnpm](https://pnpm.io/)
+- [Node.js](https://nodejs.org/) (installed in your system PATH, includes npm)
 
 ### Installation & Build
 ```powershell
 # Install dependencies
-pnpm install
+npm install
 
 # Download WASM, build, and package the extension
-pnpm run package
+npm run package
 ```
 
 ### Running the Extension

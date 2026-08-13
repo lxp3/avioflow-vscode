@@ -14,32 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate tag version
-        shell: bash
-        run: |
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          if [ "${GITHUB_REF_NAME}" != "v${PACKAGE_VERSION}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package version v${PACKAGE_VERSION}"
-            exit 1
-          fi
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: npm ci
+
+      - name: Set version from tag
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
 
       - name: Build VSIX
-        run: pnpm run package
+        run: npm run package
 
       - name: Locate VSIX
         id: vsix
@@ -58,11 +47,11 @@ jobs:
           files: ${{ steps.vsix.outputs.path }}
 
       - name: Publish Open VSX
-        run: pnpm dlx ovsx publish "${{ steps.vsix.outputs.path }}" -p "$OPENVSX_TOKEN"
+        run: npx ovsx publish "${{ steps.vsix.outputs.path }}" -p "$OPENVSX_TOKEN"
         env:
           OPENVSX_TOKEN: ${{ secrets.OPENVSX_TOKEN }}
 
       - name: Publish VS Code Marketplace
-        run: pnpm exec vsce publish --packagePath "${{ steps.vsix.outputs.path }}"
+        run: npx vsce publish --packagePath "${{ steps.vsix.outputs.path }}"
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
