@@ -59,9 +59,13 @@ export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider
         webviewPanel: vscode.WebviewPanel,
         token: vscode.CancellationToken
     ): Promise<void> {
-        if (AudioPreviewProvider.currentPanel && AudioPreviewProvider.currentPanel !== webviewPanel) {
-            await this.reuseExistingEditor(document, webviewPanel);
-            return;
+        const previousPanel = AudioPreviewProvider.currentPanel !== webviewPanel
+            ? AudioPreviewProvider.currentPanel
+            : undefined;
+
+        if (previousPanel) {
+            this.currentSession = undefined;
+            AudioPreviewProvider.currentRequestId += 1;
         }
 
         AudioPreviewProvider.currentPanel = webviewPanel;
@@ -96,6 +100,12 @@ export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider
                 this.currentSession = undefined;
             }
         });
+
+        if (previousPanel) {
+            previousPanel.dispose();
+        }
+
+        void vscode.commands.executeCommand('revealInExplorer', document.uri);
     }
 
     private async loadAndSendData(document: vscode.CustomDocument, webviewPanel: vscode.WebviewPanel) {
@@ -213,21 +223,6 @@ export class AudioPreviewProvider implements vscode.CustomReadonlyEditorProvider
             if (this.isCurrentRequest(webviewPanel, requestId)) {
                 this.reportError(webviewPanel, this.normalizeError(error, session.filePath));
             }
-        }
-    }
-
-    private async reuseExistingEditor(document: vscode.CustomDocument, transientPanel: vscode.WebviewPanel) {
-        const panel = AudioPreviewProvider.currentPanel;
-        if (!panel) {
-            return;
-        }
-
-        panel.title = path.basename(document.uri.fsPath);
-        panel.reveal(panel.viewColumn);
-        transientPanel.dispose();
-
-        if (AudioPreviewProvider.currentPanelReady) {
-            await this.loadAndSendData(document, panel);
         }
     }
 
