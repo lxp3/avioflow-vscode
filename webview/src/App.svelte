@@ -1,8 +1,10 @@
 <script lang="ts">
     import { onMount } from "svelte";
-    import { ChevronLeft, ChevronRight, Pause, Play, RotateCcw, ZoomIn, ZoomOut } from "lucide-svelte";
+    import { AudioWaveform, ChartNoAxesColumn, ChevronLeft, ChevronRight, Pause, Play, RotateCcw, ZoomIn, ZoomOut } from "lucide-svelte";
     import "./globals.css";
     import FileUpload from "./components/FileUpload.svelte";
+    import { SpectrogramClient, type SpectrogramResult } from "./spectrogramClient";
+    import { createFrequencyAxis, getFrequencyTicks, type FrequencyScale } from "./spectrogram";
 
     type ViewState = "booting" | "loading" | "ready" | "error";
 
@@ -38,6 +40,23 @@
     const MAX_CANVAS_BITMAP_WIDTH = 16384;
     const MIN_ZOOM = 1;
     const MAX_ZOOM = 50;
+    // Fixed spectrogram settings. The frequency axis always runs up to the
+    // file's Nyquist frequency (max frequency 0), so it adapts to the sample rate.
+    const SPECTROGRAM_FFT_SIZE = 1024;
+    const SPECTROGRAM_SCALE: FrequencyScale = "mel";
+    const SPECTROGRAM_MIN_FREQUENCY = 20;
+    const SPECTROGRAM_MAX_FREQUENCY = 0;
+    const SPECTROGRAM_GAIN = 10;
+    const SPECTROGRAM_RANGE = 80;
+    const SPECTROGRAM_CHANNEL_HEIGHT = 240;
+    const MAX_SPECTROGRAM_CHANNEL_HEIGHT = 720;
+
+    interface SpectrogramTileMeta {
+        key: string;
+        /** Covered range of the timeline in CSS pixels. */
+        start: number;
+        end: number;
+    }
     const CHANNEL_COLORS = [
         { played: "#d32f2f", idle: "#efb7b7" },
         { played: "#1976d2", idle: "#b8d7f2" },
@@ -73,6 +92,18 @@
     let animationFrame = 0;
     let sourceGeneration = 0;
 
+    type ViewMode = "waveform" | "spectrogram";
+    let viewMode: ViewMode = "waveform";
+    let spectrogramCanvases: HTMLCanvasElement[] = [];
+    let spectrogramFrame = 0;
+    // Per channel: where the rendered tile sits (percent of the timeline), plus
+    // what it was rendered for, so scrolling inside it needs no recompute.
+    let spectrogramTiles: Array<{ left: number; width: number } | null> = [];
+    let spectrogramTileInfo: Array<SpectrogramTileMeta | null> = [];
+    let spectrogramClient: SpectrogramClient<SpectrogramTileMeta> | null = null;
+    let spectrogramDataVersion = 0;
+    let spectrogramSentVersion = -1;
+    let selectedChannel: number | null = null;
     let waveformCanvas: HTMLCanvasElement;
     let progressCanvas: HTMLCanvasElement;
     let canvasContainer: HTMLDivElement;
@@ -90,6 +121,9 @@
     let pointerStartScrollLeft = 0;
     let manualViewport = false;
     let channelHeight = DEFAULT_CHANNEL_HEIGHT;
+    // Height to restore when switching view mode; the spectrogram wants more
+    // vertical room than the waveform to show its frequency detail.
+    let otherModeChannelHeight = SPECTROGRAM_CHANNEL_HEIGHT;
     let isResizingHeight = false;
     let resizeStartY = 0;
     let resizeStartHeight = DEFAULT_CHANNEL_HEIGHT;
@@ -120,6 +154,8 @@
             window.removeEventListener("pointerup", finishHeightResize);
             resizeObserver?.disconnect();
             cancelAnimationFrame(animationFrame);
+            cancelAnimationFrame(spectrogramFrame);
+            spectrogramClient?.dispose();
             stopSource();
             audioContext?.close();
         };
@@ -148,6 +184,7 @@
         switch (message.type) {
             case "loading":
                 resetPlayback();
+                selectedChannel = null;
                 viewState = "loading";
                 filePath = message.filePath || "";
                 metadata = null;
@@ -208,6 +245,7 @@
                 pageDuration = message.pageDuration ?? Math.max(0, pageEnd - pageStart);
                 currentTime = pageStart;
                 pauseOffset = pageStart;
+                invalidateSpectrograms();
                 samples = (message.samples || []).map((channel: unknown) =>
                     channel instanceof Float32Array ? channel : new Float32Array(channel as ArrayLike<number>)
                 );
@@ -284,12 +322,118 @@
     }
 
     function renderWaveforms() {
-        if (!waveformCanvas || !progressCanvas || !canvasContainer || samples.length === 0) return;
+        if (!canvasContainer || samples.length === 0) return;
         const viewportWidth = canvasContainer.clientWidth;
         if (viewportWidth === 0) return;
         canvasWidth = Math.max(viewportWidth, Math.round(viewportWidth * zoom));
+        if (viewMode === "spectrogram") {
+            requestSpectrograms();
+            return;
+        }
+        if (!waveformCanvas || !progressCanvas) return;
         drawWaveformCanvas(waveformCanvas, false);
         drawWaveformCanvas(progressCanvas, true);
+    }
+
+    function spectrogramKey(): string {
+        const dpr = window.devicePixelRatio || 1;
+        return `${canvasWidth}|${channelHeight}|${dpr}|${spectrogramDataVersion}`;
+    }
+
+    function invalidateSpectrograms() {
+        spectrogramDataVersion++;
+        spectrogramTiles = [];
+        spectrogramTileInfo = [];
+    }
+
+    /**
+     * Renders a tile covering the viewport plus half a viewport of margin on each
+     * side, off the main thread. Scrolling inside the tile only moves the
+     * canvas; a new tile is requested when the viewport nears its edge.
+     */
+    function requestSpectrograms() {
+        if (viewMode !== "spectrogram" || samples.length === 0 || !canvasContainer || canvasWidth === 0) return;
+        spectrogramClient ??= new SpectrogramClient<SpectrogramTileMeta>(handleSpectrogramResult);
+        if (spectrogramSentVersion !== spectrogramDataVersion) {
+            spectrogramClient.setData(samples);
+            spectrogramSentVersion = spectrogramDataVersion;
+        }
+
+        const dpr = window.devicePixelRatio || 1;
+        const key = spectrogramKey();
+        const viewport = canvasContainer.clientWidth;
+        const scrollLeft = canvasContainer.scrollLeft;
+        const start = Math.max(0, Math.floor(scrollLeft - viewport * 0.5));
+        const end = Math.min(canvasWidth, Math.ceil(scrollLeft + viewport * 1.5));
+        const needStart = Math.max(0, scrollLeft - viewport * 0.1);
+        const needEnd = Math.min(canvasWidth, scrollLeft + viewport * 1.1);
+
+        samples.forEach((_, channel) => {
+            const info = spectrogramTileInfo[channel];
+            if (info && info.key === key && info.start <= needStart && info.end >= needEnd) return;
+            spectrogramClient!.request(
+                channel,
+                {
+                    x0: Math.round(start * dpr),
+                    width: Math.max(1, Math.round((end - start) * dpr)),
+                    totalWidth: Math.round(canvasWidth * dpr),
+                    height: Math.max(1, Math.round(channelHeight * dpr)),
+                    fftSize: SPECTROGRAM_FFT_SIZE,
+                    dynamicRange: SPECTROGRAM_RANGE,
+                    gain: SPECTROGRAM_GAIN,
+                    sampleRate: metadata!.sampleRate,
+                    scale: SPECTROGRAM_SCALE,
+                    minFrequency: SPECTROGRAM_MIN_FREQUENCY,
+                    maxFrequency: SPECTROGRAM_MAX_FREQUENCY,
+                },
+                { key, start, end },
+            );
+        });
+    }
+
+    function handleSpectrogramResult(result: SpectrogramResult<SpectrogramTileMeta>) {
+        if (viewMode !== "spectrogram") return;
+        if (result.meta.key !== spectrogramKey()) {
+            requestSpectrograms();
+            return;
+        }
+        const target = spectrogramCanvases[result.channel];
+        const context = target?.getContext("2d");
+        if (!target || !context) return;
+        const { x0, width, height, totalWidth } = result.options;
+        target.width = width;
+        target.height = height;
+        context.putImageData(new ImageData(result.pixels as Uint8ClampedArray<ArrayBuffer>, width, height), 0, 0);
+
+        const tiles = [...spectrogramTiles];
+        tiles[result.channel] = { left: (x0 / totalWidth) * 100, width: (width / totalWidth) * 100 };
+        spectrogramTiles = tiles;
+        spectrogramTileInfo[result.channel] = result.meta;
+        // The viewport may have moved while this tile was being computed.
+        requestSpectrograms();
+    }
+
+    function handleViewportScroll() {
+        if (viewMode !== "spectrogram" || spectrogramFrame) return;
+        spectrogramFrame = requestAnimationFrame(() => {
+            spectrogramFrame = 0;
+            requestSpectrograms();
+        });
+    }
+
+    function setViewMode(mode: ViewMode) {
+        if (mode === viewMode) return;
+        viewMode = mode;
+        [channelHeight, otherModeChannelHeight] = [otherModeChannelHeight, channelHeight];
+        // The canvases are recreated when the mode changes, so drop old tiles.
+        spectrogramTiles = [];
+        spectrogramTileInfo = [];
+        requestAnimationFrame(renderWaveforms);
+    }
+
+    function formatFrequency(hz: number): string {
+        if (hz === 0) return "0";
+        return hz >= 1000 ? `${(hz / 1000).toFixed(hz % 1000 === 0 ? 0 : 1)}k` : `${Math.round(hz)}`;
     }
 
     function getTimeTicks(startTime: number, endTime: number, width: number): Array<{ time: number; left: number; major: boolean }> {
@@ -438,9 +582,20 @@
         return Math.max(pageStart, Math.min(pageEnd, pageStart + (absoluteX / canvasWidth) * pageDuration));
     }
 
+    // Selecting a track focuses the viewport so Space / arrow shortcuts apply
+    // even if focus was on a toolbar button (which would swallow Space).
+    function selectChannel(channel: number) {
+        selectedChannel = channel;
+        canvasContainer?.focus({ preventScroll: true });
+    }
+
     function beginWaveformGesture(event: PointerEvent) {
         if (!audioBuffer || pageDuration <= 0) return;
         event.preventDefault();
+        const stageTop = canvasContainer.getBoundingClientRect().top + TIME_AXIS_HEIGHT;
+        const channelAtPointer = Math.floor((event.clientY - stageTop) / channelHeight);
+        if (channelAtPointer >= 0 && channelAtPointer < samples.length) selectedChannel = channelAtPointer;
+        canvasContainer.focus({ preventScroll: true });
         pointerIsDown = true;
         isPanning = false;
         pointerStartX = event.clientX;
@@ -470,7 +625,7 @@
     function handlePointerMove(event: PointerEvent) {
         if (isResizingHeight) {
             const deltaPerChannel = (event.clientY - resizeStartY) / Math.max(1, samples.length);
-            channelHeight = Math.round(Math.max(MIN_CHANNEL_HEIGHT, Math.min(MAX_CHANNEL_HEIGHT, resizeStartHeight + deltaPerChannel)));
+            channelHeight = Math.round(Math.max(MIN_CHANNEL_HEIGHT, Math.min(viewMode === "spectrogram" ? MAX_SPECTROGRAM_CHANNEL_HEIGHT : MAX_CHANNEL_HEIGHT, resizeStartHeight + deltaPerChannel)));
             renderWaveforms();
             return;
         }
@@ -617,6 +772,7 @@
     }
 
     $: waveformHeight = samples.length > 0 ? samples.length * channelHeight : 128;
+    $: frequencyTicks = metadata ? getFrequencyTicks(metadata.sampleRate, SPECTROGRAM_SCALE, channelHeight, SPECTROGRAM_MIN_FREQUENCY, SPECTROGRAM_MAX_FREQUENCY) : [];
     $: timeTicks = getTimeTicks(pageStart, pageEnd, canvasWidth);
     $: observeCanvasContainer(canvasContainer);
     $: progressRatio = pageDuration > 0 ? Math.max(0, Math.min(1, (currentTime - pageStart) / pageDuration)) : 0;
@@ -676,6 +832,10 @@
                 </label>
 
                 <div class="toolbar-actions">
+                    <div class="view-toggle" role="group" aria-label="视图模式">
+                        <button class:active={viewMode === "waveform"} aria-pressed={viewMode === "waveform"} on:click={() => setViewMode("waveform")} title="波形"><AudioWaveform size={15} /><span>波形</span></button>
+                        <button class:active={viewMode === "spectrogram"} aria-pressed={viewMode === "spectrogram"} on:click={() => setViewMode("spectrogram")} title="频谱" disabled={!audioBuffer}><ChartNoAxesColumn size={15} /><span>频谱</span></button>
+                    </div>
                     <div class="page-controls" aria-label="音频分页">
                         <button on:click={() => loadPage(pageIndex - 1)} disabled={isLoadingSamples || pageIndex <= 0} aria-label="上一段"><ChevronLeft size={16} /></button>
                         <span title={`${formatSeconds(pageStart)} - ${formatSeconds(pageEnd)}`}>
@@ -697,11 +857,24 @@
 
             <div class="waveform-body">
                 {#if samples.length > 0}
-                    <div class="track-column" style={`height:${waveformHeight + TIME_AXIS_HEIGHT}px`}>
+                    <div class="track-column" class:spectro={viewMode === "spectrogram"} style={`height:${waveformHeight + TIME_AXIS_HEIGHT}px`}>
                         <div class="track-axis-label">时间</div>
                         <div class="track-labels" aria-label="通道轨道" style={`height:${waveformHeight}px`}>
                         {#each samples as _, channel}
-                            <div style={`height:${channelHeight}px`}><span style={`background:${CHANNEL_COLORS[channel % 2].played}`}></span>ch-{channel}</div>
+                            <div
+                                class="track-label"
+                                class:selected={selectedChannel === channel}
+                                role="presentation"
+                                style={`height:${channelHeight}px`}
+                                on:pointerdown|preventDefault={() => selectChannel(channel)}
+                            >
+                                <span style={`background:${CHANNEL_COLORS[channel % 2].played}`}></span>ch-{channel}
+                                {#if viewMode === "spectrogram" && metadata}
+                                    {#each frequencyTicks as tick}
+                                        <em class="freq" class:edge-top={tick.top === 0} class:edge-bottom={tick.top === 100} style={`top:${tick.top}%`}>{formatFrequency(tick.hz)}</em>
+                                    {/each}
+                                {/if}
+                            </div>
                         {/each}
                         </div>
                     </div>
@@ -720,6 +893,7 @@
                     aria-valuenow={currentTime}
                     aria-valuetext={`${formatSeconds(currentTime)} / ${formatSeconds(duration)}`}
                     on:wheel={handleWheel}
+                    on:scroll={handleViewportScroll}
                     on:pointerdown={beginWaveformGesture}
                     on:keydown={handleWaveformKeyDown}
                 >
@@ -737,14 +911,37 @@
                                     </div>
                                 {/each}
                             </div>
-                            <div class="canvas-stage" style={`top:${TIME_AXIS_HEIGHT}px;width:${canvasWidth}px;height:${waveformHeight}px`}>
-                                <canvas bind:this={waveformCanvas} class="waveform-layer"></canvas>
-                                <div class="progress-clip" style={`width:${progressRatio * 100}%`}>
-                                    <canvas bind:this={progressCanvas} class="waveform-layer"></canvas>
-                                </div>
+                            <div class="canvas-stage" class:dark={viewMode === "spectrogram"} style={`top:${TIME_AXIS_HEIGHT}px;width:${canvasWidth}px;height:${waveformHeight}px`}>
+                                {#if viewMode === "spectrogram"}
+                                    {#each samples as _, channel}
+                                        {@const tile = spectrogramTiles[channel]}
+                                        <canvas
+                                            bind:this={spectrogramCanvases[channel]}
+                                            class="spectrogram-layer"
+                                            style={`top:${channel * channelHeight}px;height:${channelHeight}px;` + (tile ? `left:${tile.left}%;width:${tile.width}%` : "display:none")}
+                                        ></canvas>
+                                    {/each}
+                                {:else}
+                                    <canvas bind:this={waveformCanvas} class="waveform-layer"></canvas>
+                                    <div class="progress-clip" style={`width:${progressRatio * 100}%`}>
+                                        <canvas bind:this={progressCanvas} class="waveform-layer"></canvas>
+                                    </div>
+                                {/if}
                                 {#each samples as _, channel}
                                     <div class="channel-divider" style={`top:${(channel + 1) * channelHeight}px`}></div>
                                 {/each}
+                                {#if viewMode === "spectrogram"}
+                                    {#each samples as _, channel}
+                                        {#each frequencyTicks as tick}
+                                            {#if tick.top > 0 && tick.top < 100}
+                                                <div class="freq-grid" style={`top:${channel * channelHeight + (tick.top / 100) * channelHeight}px`}></div>
+                                            {/if}
+                                        {/each}
+                                    {/each}
+                                {/if}
+                                {#if selectedChannel !== null && selectedChannel < samples.length}
+                                    <div class="channel-selection" style={`top:${selectedChannel * channelHeight}px;height:${channelHeight}px`}></div>
+                                {/if}
                             </div>
                             <div class="playhead" style={`left:${progressRatio * 100}%`}></div>
                         </div>
@@ -765,6 +962,9 @@
 
             <div class="waveform-hint">
                 <span>当前区间 {formatSeconds(pageStart)} – {formatSeconds(pageEnd)}</span>
+                {#if viewMode === "spectrogram" && metadata}
+                    <span>频谱 · Mel 频率 {frequencyTicks.length > 0 ? `${Math.round(frequencyTicks[frequencyTicks.length - 1].hz).toLocaleString()}–${Math.round(frequencyTicks[0].hz).toLocaleString()}` : ""} Hz</span>
+                {/if}
                 <span>点击或拖动垂直播放头调整进度 · 滚轮缩放 · 空格播放/暂停</span>
             </div>
         </section>
@@ -834,6 +1034,7 @@
     .page-controls span { min-width: 48px; color: var(--muted); font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
     .waveform-body { display: flex; width: 100%; background: #fff; }
     .track-column { flex: 0 0 58px; background: #fff; }
+    .track-column.spectro { flex-basis: 92px; }
     .track-axis-label { height: 24px; display: flex; align-items: center; justify-content: center; color: #7a867e; font-size: 10px; }
     .track-labels { color: #657269; }
     .track-labels div { display: flex; align-items: center; gap: 6px; padding: 0 8px; font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -842,14 +1043,32 @@
     .waveform-viewport.is-seeking { cursor: ew-resize; }
     .waveform-viewport.is-panning { cursor: grabbing; user-select: none; }
     .timeline-stage { position: relative; min-width: 100%; }
-    .time-axis { position: absolute; inset: 0 0 auto; background: #fff; pointer-events: none; }
+    .time-axis { position: absolute; inset: 0 0 auto; z-index: 1; background: #fff; pointer-events: none; }
     .time-tick { position: absolute; bottom: 0; width: 1px; height: 6px; background: #aebbb3; }
     .time-tick.major { height: 9px; background: #839087; }
-    .time-tick span { position: absolute; top: 2px; left: 3px; color: #758179; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+    .time-tick span { position: absolute; bottom: 11px; left: 3px; color: #758179; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
     .time-tick:last-child span { left: auto; right: 3px; }
     .canvas-stage { position: absolute; left: 0; min-width: 100%; }
     .waveform-layer { position: absolute; inset: 0; display: block; }
     .progress-clip { position: absolute; inset: 0 auto 0 0; overflow: hidden; pointer-events: none; }
+    .canvas-stage.dark { background: #000004; }
+    .spectrogram-layer { position: absolute; display: block; }
+    .view-toggle { display: flex; overflow: hidden; border: 1px solid var(--border); border-radius: 6px; }
+    .view-toggle button { display: inline-flex; align-items: center; gap: 4px; height: 27px; padding: 0 9px; border: 0; background: #fff; color: #56635b; font-size: 11px; cursor: pointer; }
+    .view-toggle button + button { border-left: 1px solid var(--border); }
+    .view-toggle button:hover:not(:disabled):not(.active) { background: var(--accent-soft); }
+    .view-toggle button.active { background: var(--accent); color: #fff; }
+    .view-toggle button:disabled { cursor: default; opacity: .4; }
+    .track-label { position: relative; cursor: pointer; user-select: none; }
+    .track-label:hover { background: var(--surface-muted); }
+    .track-label.selected { background: var(--accent-soft); color: var(--accent-dark); }
+    .channel-selection { position: absolute; left: 0; right: 0; background: rgba(47, 133, 90, 0.07); box-shadow: inset 0 0 0 1px rgba(47, 133, 90, 0.35); pointer-events: none; }
+    .waveform-viewport:focus { outline: none; }
+    .freq { position: absolute; right: 4px; color: #7a867e; font: normal 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .freq { transform: translateY(-50%); }
+    .freq.edge-top { transform: none; margin-top: 1px; }
+    .freq.edge-bottom { transform: translateY(-100%); margin-top: -1px; }
+    .freq-grid { position: absolute; left: 0; right: 0; height: 1px; background: rgba(255, 255, 255, 0.14); pointer-events: none; }
     .channel-divider { display: none; }
     .channel-divider:last-of-type { display: none; }
     .playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: #000; pointer-events: none; transform: translateX(-.5px); }
