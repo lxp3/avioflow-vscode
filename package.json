@@ -2,7 +2,7 @@
   "name": "avioflow",
   "displayName": "Avioflow",
   "description": "High-performance audio engine and toolkit for VS Code",
-  "version": "0.4.0",
+  "version": "0.0.0",
   "publisher": "lxp3",
   "repository": {
     "type": "git",
@@ -66,7 +66,7 @@
     "vscode:prepublish": "npm run build",
     "fetch:wasm": "node scripts/fetch-wasm.mjs",
     "build": "npm run fetch:wasm && npm run compile",
-    "package": "npx vsce package --no-dependencies",
+    "package": "npx vsce package --no-dependencies --out avioflow.vsix",
     "compile": "npm run build:webview && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "build:webview": "vite build webview"

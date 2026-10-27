@@ -4,11 +4,11 @@ import path from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 
 const root = path.resolve(import.meta.dirname, '..');
-const version = '0.7.6';
+const version = '0.8.1';
 const baseUrl = `https://github.com/lxp3/avioflow/releases/download/v${version}`;
 const wasmDirectory = path.join(root, 'wasm');
 const versionFile = path.join(wasmDirectory, '.version');
-const expectedWasmSha256 = '3626bfb197b0e14be06070041d8cb7622d71656e4807feea50f0f260aa6b96b8';
+const expectedWasmSha256 = '66d7cfb6b39990df39c9564d3134a0893d55615892a67d0a642c0de11cb24527';
 
 async function sha256(filePath) {
     return createHash('sha256').update(await readFile(filePath)).digest('hex');

@@ -41,27 +41,27 @@ jobs:
         run: npm run build
 
       - name: Package VSIX
-        run: npx --no-install vsce package --no-dependencies --out "avioflow-${GITHUB_REF_NAME}.vsix"
+        run: npx --no-install vsce package --no-dependencies --out "avioflow.vsix"
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
         with:
           name: avioflow-${{ github.ref_name }}
-          path: avioflow-${{ github.ref_name }}.vsix
+          path: avioflow.vsix
           if-no-files-found: error
 
       - name: Publish to VS Code Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: npx --no-install vsce publish --packagePath "avioflow-${GITHUB_REF_NAME}.vsix"
+        run: npx --no-install vsce publish --packagePath "avioflow.vsix"
 
       - name: Publish to Open VSX Registry
         env:
           OPENVSX_TOKEN: ${{ secrets.OPENVSX_TOKEN }}
-        run: npx --yes ovsx@0.10.4 publish "avioflow-${GITHUB_REF_NAME}.vsix" --pat "$OPENVSX_TOKEN"
+        run: npx --yes ovsx@0.10.4 publish "avioflow.vsix" --pat "$OPENVSX_TOKEN"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: avioflow-${{ github.ref_name }}.vsix
+          files: avioflow.vsix
           generate_release_notes: true
