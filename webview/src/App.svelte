@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount } from "svelte";
-    import { AudioWaveform, ChartNoAxesColumn, ChevronLeft, ChevronRight, Pause, Play, RotateCcw, ZoomIn, ZoomOut } from "lucide-svelte";
+    import { AudioWaveform, ChartNoAxesColumn, ChevronLeft, ChevronRight, Pause, Play, RotateCcw, ZoomIn, ZoomOut, X } from "lucide-svelte";
     import "./globals.css";
     import FileUpload from "./components/FileUpload.svelte";
     import { SpectrogramClient, type SpectrogramResult } from "./spectrogramClient";
@@ -32,11 +32,12 @@
         code?: string;
     }
 
-    const DEFAULT_CHANNEL_HEIGHT = 120;
+    const DEFAULT_CHANNEL_HEIGHT = 132;
     const MIN_CHANNEL_HEIGHT = 48;
     const MAX_CHANNEL_HEIGHT = 360;
     const TIME_AXIS_HEIGHT = 24;
     const PAN_THRESHOLD = 5;
+    const MIN_LOOP_DURATION = 0.02;
     const MAX_CANVAS_BITMAP_WIDTH = 16384;
     const MIN_ZOOM = 1;
     const MAX_ZOOM = 50;
@@ -91,6 +92,9 @@
     let pauseOffset = 0;
     let animationFrame = 0;
     let sourceGeneration = 0;
+    let loopStart: number | null = null;
+    let loopEnd: number | null = null;
+    let selectionPlayback = false;
 
     type ViewMode = "waveform" | "spectrogram";
     let viewMode: ViewMode = "waveform";
@@ -119,6 +123,10 @@
     let pointerStartX = 0;
     let pointerStartY = 0;
     let pointerStartScrollLeft = 0;
+    let selectionStartTime = 0;
+    let isSelecting = false;
+    let panWithSpace = false;
+    let editingLoopHandle: "start" | "end" | null = null;
     let manualViewport = false;
     let channelHeight = DEFAULT_CHANNEL_HEIGHT;
     // Height to restore when switching view mode; the spectrogram wants more
@@ -134,6 +142,8 @@
     onMount(() => {
         window.addEventListener("message", handleMessage);
         window.addEventListener("keydown", handleKeyDown);
+        window.addEventListener("keydown", handleLoopKeyDown);
+        window.addEventListener("keyup", handleSpaceKeyUp);
         window.addEventListener("pointermove", handlePointerMove);
         window.addEventListener("pointerup", finishWaveformGesture);
         window.addEventListener("pointerup", finishHeightResize);
@@ -149,6 +159,8 @@
         return () => {
             window.removeEventListener("message", handleMessage);
             window.removeEventListener("keydown", handleKeyDown);
+            window.removeEventListener("keydown", handleLoopKeyDown);
+            window.removeEventListener("keyup", handleSpaceKeyUp);
             window.removeEventListener("pointermove", handlePointerMove);
             window.removeEventListener("pointerup", finishWaveformGesture);
             window.removeEventListener("pointerup", finishHeightResize);
@@ -177,6 +189,9 @@
         isSeeking = false;
         currentTime = 0;
         pauseOffset = 0;
+        loopStart = null;
+        loopEnd = null;
+        selectionPlayback = false;
     }
 
     function handleMessage(event: MessageEvent) {
@@ -515,9 +530,12 @@
 
     async function play() {
         if (!audioBuffer || !audioContext || pageDuration <= 0) return;
-        if (pauseOffset >= pageEnd) {
-            pauseOffset = pageStart;
-            currentTime = pageStart;
+        const hasSelection = selectionPlayback && loopStart !== null && loopEnd !== null;
+        const rangeStart = hasSelection ? (loopStart ?? pageStart) : pageStart;
+        const rangeEnd = hasSelection ? (loopEnd ?? pageEnd) : pageEnd;
+        if (pauseOffset >= rangeEnd - 0.001 || pauseOffset < rangeStart) {
+            pauseOffset = rangeStart;
+            currentTime = rangeStart;
         }
         await audioContext.resume();
         stopSource();
@@ -525,14 +543,16 @@
         sourceNode = audioContext.createBufferSource();
         sourceNode.buffer = audioBuffer;
         sourceNode.connect(gainNode || audioContext.destination);
-        sourceNode.start(0, Math.max(0, pauseOffset - pageStart));
+        const sourceOffset = Math.max(0, pauseOffset - pageStart);
+        const sourceDuration = Math.max(0.001, rangeEnd - pauseOffset);
+        sourceNode.start(0, sourceOffset, sourceDuration);
         startTime = audioContext.currentTime - pauseOffset;
         isPlaying = true;
         sourceNode.onended = () => {
             if (generation !== sourceGeneration || !isPlaying) return;
             isPlaying = false;
-            currentTime = pageEnd;
-            pauseOffset = pageEnd;
+            currentTime = rangeEnd;
+            pauseOffset = rangeEnd;
             cancelAnimationFrame(animationFrame);
         };
         updatePlayback();
@@ -540,7 +560,11 @@
 
     function pause() {
         if (!isPlaying || !audioContext) return;
-        pauseOffset = Math.min(pageEnd, Math.max(pageStart, audioContext.currentTime - startTime));
+        const hasSelection = selectionPlayback && loopStart !== null && loopEnd !== null;
+        const rangeStart = hasSelection ? (loopStart ?? pageStart) : pageStart;
+        const rangeEnd = hasSelection ? (loopEnd ?? pageEnd) : pageEnd;
+        const elapsed = audioContext.currentTime - startTime;
+        pauseOffset = Math.min(rangeEnd, Math.max(rangeStart, elapsed));
         currentTime = pauseOffset;
         isPlaying = false;
         cancelAnimationFrame(animationFrame);
@@ -560,10 +584,14 @@
 
     function updatePlayback() {
         if (!isPlaying || !audioContext) return;
-        currentTime = Math.min(pageEnd, audioContext.currentTime - startTime);
+        const hasSelection = selectionPlayback && loopStart !== null && loopEnd !== null;
+        const rangeStart = hasSelection ? (loopStart ?? pageStart) : pageStart;
+        const rangeEnd = hasSelection ? (loopEnd ?? pageEnd) : pageEnd;
+        const elapsed = audioContext.currentTime - startTime;
+        currentTime = Math.min(rangeEnd, elapsed);
         pauseOffset = currentTime;
         keepPlayheadVisible();
-        if (currentTime < pageEnd) animationFrame = requestAnimationFrame(updatePlayback);
+        if (currentTime < rangeEnd) animationFrame = requestAnimationFrame(updatePlayback);
     }
 
     function keepPlayheadVisible() {
@@ -601,15 +629,20 @@
         pointerStartX = event.clientX;
         pointerStartY = event.clientY;
         pointerStartScrollLeft = canvasContainer.scrollLeft;
+        panWithSpace = event.button === 1 || event.button === 2 || event.shiftKey || event.ctrlKey || event.metaKey;
 
         const rect = canvasContainer.getBoundingClientRect();
         const pointerX = event.clientX - rect.left + canvasContainer.scrollLeft;
         const playheadX = progressRatio * canvasWidth;
-        if (Math.abs(pointerX - playheadX) <= 8) {
+        if (!panWithSpace && Math.abs(pointerX - playheadX) <= 8) {
             resumeAfterSeek = isPlaying;
             if (isPlaying) pause();
             isSeeking = true;
             setSeekTime(timeFromPointer(event));
+        }
+        if (!panWithSpace) {
+            selectionStartTime = timeFromPointer(event);
+            isSelecting = false;
         }
     }
 
@@ -629,6 +662,13 @@
             renderWaveforms();
             return;
         }
+        if (editingLoopHandle) {
+            const time = timeFromPointer(event);
+            if (editingLoopHandle === "start" && loopEnd !== null) loopStart = Math.min(time, loopEnd - MIN_LOOP_DURATION);
+            if (editingLoopHandle === "end" && loopStart !== null) loopEnd = Math.max(time, loopStart + MIN_LOOP_DURATION);
+            if (loopStart !== null) setSeekTime(loopStart);
+            return;
+        }
         if (isSeeking) {
             setSeekTime(timeFromPointer(event));
             return;
@@ -636,14 +676,25 @@
         if (!pointerIsDown) return;
         const deltaX = event.clientX - pointerStartX;
         const deltaY = event.clientY - pointerStartY;
-        if (!isPanning && Math.hypot(deltaX, deltaY) >= PAN_THRESHOLD) {
+        if (!isPanning && panWithSpace && Math.hypot(deltaX, deltaY) >= PAN_THRESHOLD) {
             isPanning = true;
             manualViewport = true;
         }
         if (isPanning) canvasContainer.scrollLeft = pointerStartScrollLeft - deltaX;
+        else if (!panWithSpace && pointerIsDown && Math.abs(deltaX) >= PAN_THRESHOLD) {
+            isSelecting = true;
+            const start = selectionStartTime;
+            const end = timeFromPointer(event);
+            loopStart = Math.min(start, end);
+            loopEnd = Math.max(start, end);
+        }
     }
 
     function finishWaveformGesture(event: PointerEvent) {
+        if (editingLoopHandle) {
+            editingLoopHandle = null;
+            return;
+        }
         const pointerDistance = Math.hypot(event.clientX - pointerStartX, event.clientY - pointerStartY);
         const scrollDistance = Math.abs(canvasContainer.scrollLeft - pointerStartScrollLeft);
         const didPan = isPanning || pointerDistance >= PAN_THRESHOLD || scrollDistance >= 1;
@@ -651,12 +702,25 @@
             isSeeking = false;
             if (resumeAfterSeek) void play();
             resumeAfterSeek = false;
+        } else if (pointerIsDown && isSelecting && loopStart !== null && loopEnd !== null && loopEnd - loopStart >= MIN_LOOP_DURATION) {
+            selectionPlayback = true;
+            setSeekTime(loopStart);
+            isSelecting = false;
+            void play();
         } else if (pointerIsDown && !didPan) {
             manualViewport = false;
             seekWithoutChangingPlayback(timeFromPointer(event));
         }
         pointerIsDown = false;
         isPanning = false;
+        isSelecting = false;
+        panWithSpace = false;
+    }
+
+    function beginLoopHandle(event: PointerEvent, handle: "start" | "end") {
+        event.preventDefault();
+        editingLoopHandle = handle;
+        selectionPlayback = true;
     }
 
     function seekWithoutChangingPlayback(time: number) {
@@ -679,8 +743,29 @@
     }
 
     function setSeekTime(time: number) {
-        currentTime = Math.max(pageStart, Math.min(pageEnd, time));
+        const hasSelection = selectionPlayback && loopStart !== null && loopEnd !== null;
+        const rangeStart = hasSelection ? loopStart : pageStart;
+        const rangeEnd = hasSelection ? loopEnd : pageEnd;
+        currentTime = Math.max(rangeStart, Math.min(rangeEnd, time));
         pauseOffset = currentTime;
+    }
+
+    function clearLoop() {
+        const wasPlaying = isPlaying;
+        if (wasPlaying) pause();
+        loopStart = null;
+        loopEnd = null;
+        selectionPlayback = false;
+        if (wasPlaying) void play();
+    }
+
+    function handleLoopKeyDown(event: KeyboardEvent) {
+        if (event.code === "Space") panWithSpace = true;
+        if (event.key === "Escape" && loopStart !== null) clearLoop();
+    }
+
+    function handleSpaceKeyUp(event: KeyboardEvent) {
+        if (event.code === "Space") panWithSpace = false;
     }
 
     function loadPage(nextPageIndex: number) {
@@ -852,6 +937,7 @@
                         <button on:click={zoomIn} disabled={zoom >= MAX_ZOOM} aria-label="放大"><ZoomIn size={16} /></button>
                         <button on:click={resetZoom} disabled={zoom === 1} aria-label="重置缩放"><RotateCcw size={15} /></button>
                     </div>
+                    {#if loopStart !== null && loopEnd !== null}<button class="clear-loop-button" on:click={clearLoop} aria-label="清除循环选区" title="清除循环选区"><X size={15} /></button>{/if}
                 </div>
             </div>
 
@@ -942,6 +1028,12 @@
                                 {#if selectedChannel !== null && selectedChannel < samples.length}
                                     <div class="channel-selection" style={`top:${selectedChannel * channelHeight}px;height:${channelHeight}px`}></div>
                                 {/if}
+                                {#if loopStart !== null && loopEnd !== null}
+                                    <div class="loop-selection" style={`left:${((loopStart - pageStart) / pageDuration) * 100}%;width:${((loopEnd - loopStart) / pageDuration) * 100}%`}>
+                                        <button class="loop-handle loop-handle-start" aria-label="调整循环起点" on:pointerdown|stopPropagation={(event) => beginLoopHandle(event, "start")}></button>
+                                        <button class="loop-handle loop-handle-end" aria-label="调整循环终点" on:pointerdown|stopPropagation={(event) => beginLoopHandle(event, "end")}></button>
+                                    </div>
+                                {/if}
                             </div>
                             <div class="playhead" style={`left:${progressRatio * 100}%`}></div>
                         </div>
@@ -965,7 +1057,7 @@
                 {#if viewMode === "spectrogram" && metadata}
                     <span>频谱 · Mel 频率 {frequencyTicks.length > 0 ? `${Math.round(frequencyTicks[frequencyTicks.length - 1].hz).toLocaleString()}–${Math.round(frequencyTicks[0].hz).toLocaleString()}` : ""} Hz</span>
                 {/if}
-                <span>点击或拖动垂直播放头调整进度 · 滚轮缩放 · 空格播放/暂停</span>
+                <span>点击定位 · 左键拖动选择并播放一次 · 滚轮缩放 · 空格播放/暂停</span>
             </div>
         </section>
     {:else if viewState === "error" && loadError}
@@ -1059,6 +1151,7 @@
     .view-toggle button:hover:not(:disabled):not(.active) { background: var(--accent-soft); }
     .view-toggle button.active { background: var(--accent); color: #fff; }
     .view-toggle button:disabled { cursor: default; opacity: .4; }
+    .clear-loop-button { display: inline-flex; align-items: center; justify-content: center; width: 29px; height: 29px; border: 1px solid var(--border); border-radius: 6px; background: #fff; color: #56635b; cursor: pointer; }
     .track-label { position: relative; cursor: pointer; user-select: none; }
     .track-label:hover { background: var(--surface-muted); }
     .track-label.selected { background: var(--accent-soft); color: var(--accent-dark); }
@@ -1072,6 +1165,10 @@
     .channel-divider { display: none; }
     .channel-divider:last-of-type { display: none; }
     .playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: #000; pointer-events: none; transform: translateX(-.5px); }
+    .loop-selection { position: absolute; top: 0; bottom: 0; z-index: 3; background: rgba(47, 133, 90, 0.08); border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); pointer-events: none; }
+    .loop-handle { position: absolute; top: 35%; width: 8px; height: 30%; padding: 0; border: 0; border-radius: 4px; background: var(--accent-dark); cursor: ew-resize; pointer-events: auto; }
+    .loop-handle-start { left: -5px; }
+    .loop-handle-end { right: -5px; }
     .height-resizer { display: flex; width: 100%; min-width: 100%; align-items: center; justify-content: center; height: 13px; padding: 0; border: 0; border-radius: 0; background: #fff; cursor: ns-resize; touch-action: none; }
     .height-resizer span { width: 38px; height: 3px; border-radius: 999px; background: #b9c6be; }
     .height-resizer:hover span, .height-resizer.is-resizing span { background: var(--accent); }
